@@ -1,0 +1,1069 @@
+package com.funmod;
+
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+import net.minecraft.client.Minecraft;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.util.Mth;
+import com.mojang.blaze3d.platform.InputConstants;
+import org.lwjgl.glfw.GLFW;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class Main {
+    private static java.lang.reflect.Method drawStringMethod = null;
+    public static void drawStringSafely(net.minecraft.client.gui.GuiGraphics context, net.minecraft.client.gui.Font font, net.minecraft.network.chat.Component text, int x, int y, int color) {
+        try {
+            if (drawStringMethod == null) {
+                for (java.lang.reflect.Method m : context.getClass().getMethods()) {
+                    Class<?>[] types = m.getParameterTypes();
+                    if (types.length >= 5 && types.length <= 6 && types[0] == net.minecraft.client.gui.Font.class && types[1] == String.class && types[2] == int.class && types[3] == int.class && types[4] == int.class) {
+                        drawStringMethod = m;
+                        break;
+                    }
+                }
+            }
+            if (drawStringMethod != null) {
+                if (drawStringMethod.getParameterCount() == 5) {
+                    drawStringMethod.invoke(context, font, text.getString(), x, y, color);
+                } else {
+                    drawStringMethod.invoke(context, font, text.getString(), x, y, color, false);
+                }
+            }
+        } catch (Exception e) {}
+    }
+    private static boolean wasShiftPressed = false;
+    private static boolean isEnabled = true;
+    public static boolean wallhackEnabled = false;
+    public static int targetMode = 2; // 0 = Players, 1 = Mobs, 2 = Both
+    public static boolean showNames = true;
+    public static int bindWH = 0, bindAA = 0, bindESP = 0, bindTotem = 0, bindFreecam = 0, bindAutoClicker = 0;
+    public static boolean autoTotemEnabled = false, freecamEnabled = false, autoClickerEnabled = false;
+    public static void toggleFreecam(Minecraft client) {}
+
+    // AutoAttack settings
+    public static boolean aaEnabled = false;
+    public static int aaFov = 90;
+    public static float aaRadius = 3.0f;
+    public static boolean aaCritOnly = false;
+    public static boolean aaWeaponOnly = false;
+    public static int aaTargetMode = 0; // 0 = Players, 1 = Mobs+Players
+    public static boolean aaDrawFov = true;
+    public static boolean aaDrawTargetLine = true;
+    public static int aaSpeed = 3; // 1 to 5
+    public static boolean aaAimAssistOnly = false; // false = always aim, true = aim only when not on target
+    public static boolean aaAutoHit = true; // Automatically attack or only aim assist
+    
+    // Aim smoothing variables (nanoTime based)
+    private static long lastAimTime = System.nanoTime();
+    private static float targetYaw = 0f;
+    private static float targetPitch = 0f;
+    private static boolean aimActive = false;
+    private static boolean isPullingToCenter = false;
+    
+    public static float spoofOldYaw = 0;
+    public static float spoofOldPitch = 0;
+    public static boolean isSpoofing = false;
+    
+    private static boolean lastWallhackState = false;
+    
+    // Block ESP variables
+    public static boolean blockEspEnabled = false;
+    public static java.util.Set<String> espBlocks = new java.util.HashSet<>();
+    private static java.util.List<net.minecraft.core.BlockPos> foundBlocks = new java.util.ArrayList<>();
+    private static long lastBlockScan = 0;
+    private static Thread blockScanThread = null;
+
+    static class RenderEntity {
+        Entity entity;
+        LivingEntity living;
+
+        double distance;
+        double lerpX;
+        double lerpY;
+        double lerpZ;
+        public RenderEntity(Entity e, LivingEntity l, double d, double x, double y, double z) {
+            entity = e; living = l; distance = d; lerpX = x; lerpY = y; lerpZ = z;
+        }
+    }
+
+    @Override
+    public static void init() {
+        ClientTickEvents.START_CLIENT_TICK.register(client -> {
+            if (!isEnabled || client.player == null || client.getWindow() == null || client.level == null) return;
+
+            boolean isShiftPressed = org.lwjgl.glfw.GLFW.glfwGetKey(client.getWindow().getWindow(), GLFW.GLFW_KEY_RIGHT_SHIFT) == GLFW.GLFW_PRESS;
+            if (isShiftPressed && !wasShiftPressed) {
+                if (client.screen == null) {
+                    client.setScreen(new FunModScreen());
+                }
+            }
+            wasShiftPressed = isShiftPressed;
+
+            if (wallhackEnabled != lastWallhackState) {
+                lastWallhackState = wallhackEnabled;
+                client.player.displayClientMessage(Component.literal("§e[FunMod] Java 2D ESP переключен: " + (wallhackEnabled ? "ВКЛ" : "ВЫКЛ")), false);
+            }
+
+            // Логика Авто-Атаки (KillAura)
+            if (aaEnabled) {
+                Entity bestTarget = null;
+                double bestScore = Double.MAX_VALUE;
+
+                for (Entity entity : client.level.entitiesForRendering()) {
+                    if (entity == client.player) continue;
+                    if (!(entity instanceof LivingEntity living)) continue;
+                    if (!living.isAlive()) continue;
+
+                    boolean isPlayer = entity instanceof net.minecraft.world.entity.player.Player;
+                    if (aaTargetMode == 0 && !isPlayer) continue;
+
+                    double dist = client.player.distanceTo(entity);
+                    if (dist > aaRadius) continue;
+
+                    // Ограничение видимости (FOV)
+                    Vec3 lookVec = client.player.getLookAngle();
+                    Vec3 targetVec = entity.position().add(0, entity.getBbHeight() / 2, 0).subtract(client.player.getEyePosition()).normalize();
+                    double dot = lookVec.dot(targetVec);
+                    double angle = Math.toDegrees(Math.acos(dot));
+                    
+                    if (angle > aaFov / 2.0) continue;
+                    
+                    // Выбираем врага ближе к игроку (по дистанции)
+                    if (dist < bestScore) {
+                        bestScore = dist;
+                        bestTarget = entity;
+                    }
+                }
+
+                // Проверка на оружие
+                if (aaWeaponOnly && bestTarget != null) {
+                    net.minecraft.world.item.Item item = client.player.getMainHandItem().getItem();
+                    String itemName = item.getDescriptionId().toLowerCase();
+                    if (!itemName.contains("sword") && !itemName.contains("axe")) {
+                        bestTarget = null;
+                    }
+                }
+
+                if (bestTarget != null) {
+                    Vec3 targetPos = bestTarget.position().add(0, bestTarget.getBbHeight() / 2, 0);
+                    double dX = targetPos.x - client.player.getX();
+                    double dY = targetPos.y - client.player.getEyeY();
+                    double dZ = targetPos.z - client.player.getZ();
+                    
+                    double distance = Math.sqrt(dX * dX + dZ * dZ);
+                    float targetYaw = (float) (Math.atan2(dZ, dX) * (180.0 / Math.PI)) - 90.0f;
+                    float targetPitch = (float) -(Math.atan2(dY, distance) * (180.0 / Math.PI));
+                    
+                    // Убран рандомный шум, так как он вызывает нереалистичную тряску прицела.
+                    
+                    // Поскольку мы наводимся плавно каждый кадр, нам нужно убедиться,
+                    // что серверный тик вообще "знает", куда смотрит наша камера.
+                    // Для античита важно, чтобы реальные углы игрока (а не только визуальные)
+                    // совпадали с тем, что мы отправляем на сервер при атаке.
+                    
+                    // Поскольку мы теперь наводимся в рендере (как в примере пользователя),
+                    // здесь проверяем атаку
+                    if (client.crosshairPickEntity == bestTarget) {
+                        if (client.player.getAttackStrengthScale(0.0f) >= 1.0f) {
+                            boolean canCrit = !client.player.onGround() && client.player.fallDistance > 0.0F && !client.player.isInWater() && !client.player.hasEffect(net.minecraft.world.effect.MobEffects.BLINDNESS) && !client.player.isPassenger();
+                            
+                            if (!aaCritOnly || canCrit) {
+                                client.gameMode.attack(client.player, bestTarget);
+                                client.player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+                                System.out.println("[FunMod] Успешная атака по цели: " + bestTarget.getType().toShortString());
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        HudRenderCallback.EVENT.register((context, tickDelta) -> {
+            Minecraft client = Minecraft.getInstance();
+            if (client.player == null || client.level == null) return;
+            
+            // === Плавная наводка (на основе System.nanoTime(), независимо от FPS) ===
+            if (isEnabled && aaEnabled) {
+                Entity bestTarget = null;
+                double bestScore = Double.MAX_VALUE;
+
+                for (Entity entity : client.level.entitiesForRendering()) {
+                    if (entity == client.player) continue;
+                    if (!(entity instanceof LivingEntity living)) continue;
+                    if (!living.isAlive()) continue;
+
+                    boolean isPlayer = entity instanceof net.minecraft.world.entity.player.Player;
+                    if (aaTargetMode == 0 && !isPlayer) continue;
+
+                    double dist = client.player.distanceTo(entity);
+                    if (dist > aaRadius) continue;
+
+                    Vec3 lookVec = client.player.getLookAngle();
+                    Vec3 targetVec = entity.position().add(0, entity.getBbHeight() / 2, 0).subtract(client.player.getEyePosition()).normalize();
+                    double dot = lookVec.dot(targetVec);
+                    double angle = Math.toDegrees(Math.acos(dot));
+                    
+                    if (angle > aaFov / 2.0) continue;
+                    
+                    if (dist < bestScore) {
+                        bestScore = dist;
+                        bestTarget = entity;
+                    }
+                }
+
+                if (aaWeaponOnly && bestTarget != null) {
+                    net.minecraft.world.item.Item item = client.player.getMainHandItem().getItem();
+                    String itemName = item.getDescriptionId().toLowerCase();
+                    if (!itemName.contains("sword") && !itemName.contains("axe")) {
+                        bestTarget = null;
+                    }
+                }
+
+                if (bestTarget != null) {
+                    Vec3 targetPos = bestTarget.position().add(0, bestTarget.getBbHeight() / 2, 0);
+                    
+                    double dX = targetPos.x - client.player.getX();
+                    double dY = targetPos.y - client.player.getEyeY();
+                    double dZ = targetPos.z - client.player.getZ();
+                    
+                    double distXZ = Math.sqrt(dX * dX + dZ * dZ);
+                    
+                    targetYaw = (float) Math.toDegrees(Math.atan2(dZ, dX)) - 90.0F;
+                    targetPitch = (float) -Math.toDegrees(Math.atan2(dY, distXZ));
+                    
+                    if (!aimActive) {
+                        lastAimTime = System.nanoTime();
+                        aimActive = true;
+                    }
+                    
+                    long currentTime = System.nanoTime();
+                    float dt = (currentTime - lastAimTime) / 1_000_000_000.0f;
+                    lastAimTime = currentTime;
+                    
+                    if (dt > 0.05f) dt = 0.05f; // Защита от фризов
+                    
+                    float currentYaw = client.player.getYRot();
+                    float yawDiff = Mth.wrapDegrees(targetYaw - currentYaw);
+                    
+                    float currentPitch = client.player.getXRot();
+                    float pitchDiff = Mth.wrapDegrees(targetPitch - currentPitch);
+                    
+                    if (Math.abs(yawDiff) >= 0.5f || Math.abs(pitchDiff) >= 0.5f) {
+                        // Скорость наводки от 1 до 5 (переводим в TURN_SPEED: от 10.0 до 30.0)
+                        float turnSpeed = 10.0f + (aaSpeed - 1) * 5.0f;
+                        float lerpFactor = 1.0f - (float) Math.exp(-turnSpeed * dt);
+                        
+                        float newYaw = currentYaw + (yawDiff * lerpFactor);
+                        float newPitch = currentPitch + (pitchDiff * lerpFactor);
+                        
+                        client.player.setYRot(newYaw);
+                        client.player.yRotO = newYaw; // prevYaw
+                        client.player.setXRot(newPitch);
+                        client.player.xRotO = newPitch; // prevPitch
+                    }
+                } else {
+                    aimActive = false;
+                }
+            } else {
+                aimActive = false;
+            }
+
+            float tick = tickDelta.getRealtimeDeltaTicks();
+            double camX = Mth.lerp(tick, client.player.xOld, client.player.getX());
+            double camY = Mth.lerp(tick, client.player.yOld, client.player.getY()) + client.player.getEyeHeight();
+            double camZ = Mth.lerp(tick, client.player.zOld, client.player.getZ());
+            Vec3 camPos = new Vec3(camX, camY, camZ);
+
+            float pitch = (float) Math.toRadians(Mth.lerp(tick, client.player.xRotO, client.player.getXRot()));
+            float yaw = (float) Math.toRadians(Mth.lerp(tick, client.player.yRotO, client.player.getYRot()));
+
+            double fX = -Math.sin(yaw) * Math.cos(pitch);
+            double fY = -Math.sin(pitch);
+            double fZ = Math.cos(yaw) * Math.cos(pitch);
+            Vec3 F = new Vec3(fX, fY, fZ);
+
+            double rX = -Math.sin(yaw + Math.PI / 2);
+            double rZ = Math.cos(yaw + Math.PI / 2);
+            Vec3 R = new Vec3(rX, 0, rZ);
+
+            Vec3 U = R.cross(F).normalize();
+
+            float fov = client.options.fov().get().floatValue();
+            double halfFovTan = Math.tan(Math.toRadians(fov) / 2.0);
+
+            int screenWidth = client.getWindow().getGuiScaledWidth();
+            int screenHeight = client.getWindow().getGuiScaledHeight();
+            
+            Entity currentTargetForLine = null;
+            if (aaEnabled && aaDrawTargetLine && aimActive) {
+                // Ищем цель, которую мы зафиксировали в этом кадре (по углу или дистанции)
+                double minD = Double.MAX_VALUE;
+                for (Entity e : client.level.entitiesForRendering()) {
+                    if (e instanceof LivingEntity && e.isAlive() && e != client.player) {
+                        double d = client.player.distanceTo(e);
+                        if (d <= aaRadius && d < minD) {
+                            Vec3 tv = e.position().add(0, e.getBbHeight() / 2, 0).subtract(client.player.getEyePosition()).normalize();
+                            double dot = client.player.getLookAngle().dot(tv);
+                            if (Math.toDegrees(Math.acos(dot)) <= aaFov / 2.0) {
+                                boolean isPlayer = e instanceof net.minecraft.world.entity.player.Player;
+                                if (aaTargetMode == 1 || isPlayer) {
+                                    if (!aaWeaponOnly || (client.player.getMainHandItem().getItem().getDescriptionId().toLowerCase().contains("sword") || client.player.getMainHandItem().getItem().getDescriptionId().toLowerCase().contains("axe"))) {
+                                        minD = d;
+                                        currentTargetForLine = e;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (wallhackEnabled) {
+                List<RenderEntity> toRender = new ArrayList<>();
+
+                for (Entity entity : client.level.entitiesForRendering()) {
+                    if (entity == client.player) continue;
+                    if (!(entity instanceof LivingEntity living)) continue;
+
+                    double lerpX = Mth.lerp(tick, entity.xOld, entity.getX());
+                    double lerpY = Mth.lerp(tick, entity.yOld, entity.getY());
+                    double lerpZ = Mth.lerp(tick, entity.zOld, entity.getZ());
+
+                    double dist = camPos.distanceTo(new Vec3(lerpX, lerpY, lerpZ));
+                    
+                    if (dist > 128) continue;
+
+                    boolean isPlayer = entity instanceof net.minecraft.world.entity.player.Player;
+                    if (targetMode == 0 && !isPlayer) continue;
+                    if (targetMode == 1 && isPlayer) continue; 
+
+                    toRender.add(new RenderEntity(entity, living, dist, lerpX, lerpY, lerpZ));
+                }
+
+                toRender.sort((a, b) -> Double.compare(b.distance, a.distance));
+
+            for (RenderEntity re : toRender) {
+                float width = re.entity.getType().getWidth() / 2.0f;
+                float height = re.entity.getType().getHeight();
+
+                Vec3[] corners = {
+                    new Vec3(re.lerpX - width, re.lerpY, re.lerpZ - width),
+                    new Vec3(re.lerpX - width, re.lerpY + height, re.lerpZ - width),
+                    new Vec3(re.lerpX + width, re.lerpY, re.lerpZ - width),
+                    new Vec3(re.lerpX + width, re.lerpY + height, re.lerpZ - width),
+                    new Vec3(re.lerpX - width, re.lerpY, re.lerpZ + width),
+                    new Vec3(re.lerpX - width, re.lerpY + height, re.lerpZ + width),
+                    new Vec3(re.lerpX + width, re.lerpY, re.lerpZ + width),
+                    new Vec3(re.lerpX + width, re.lerpY + height, re.lerpZ + width)
+                };
+
+                double minX = screenWidth * 2, minY = screenHeight * 2, maxX = -screenWidth, maxY = -screenHeight;
+                int validCorners = 0;
+
+                for (Vec3 corner : corners) {
+                    Vec3 P = corner.subtract(camPos);
+                    double zPrime = P.dot(F);
+                    
+                    if (zPrime > 0.1) {
+                        double xPrime = P.dot(R);
+                        double yPrime = P.dot(U);
+                        
+                        double sX = screenWidth / 2.0 + (xPrime / zPrime) * (screenHeight / 2.0) / halfFovTan;
+                        double sY = screenHeight / 2.0 - (yPrime / zPrime) * (screenHeight / 2.0) / halfFovTan;
+                        
+                        if (sX < minX) minX = sX;
+                        if (sX > maxX) maxX = sX;
+                        if (sY < minY) minY = sY;
+                        if (sY > maxY) maxY = sY;
+                        validCorners++;
+                    }
+                }
+
+                if (validCorners > 0 && minX < screenWidth && maxX > 0 && minY < screenHeight && maxY > 0) {
+                    int boxX = (int) minX;
+                    int boxY = (int) minY;
+                    int boxW = (int) (maxX - minX);
+                    int boxH = (int) (maxY - minY);
+
+                    if (boxW > screenWidth * 2) boxW = screenWidth * 2;
+                    if (boxH > screenHeight * 2) boxH = screenHeight * 2;
+
+                    // Динамическая прозрачность: быстрее затухает (за 64 блока), максимальная прозрачность 65% (альфа не ниже 0.35)
+                    float alphaFactor = Math.max(0.35f, 1.0f - (float)(re.distance / 64.0f));
+                    int alpha = (int)(255 * alphaFactor);
+                    int color = (alpha << 24) | 0x00FFFFFF;
+
+                    // Толщина линии минимальная (1 пиксель)
+                    int thickness = 1;
+                    context.fill(boxX, boxY, boxX + boxW, boxY + thickness, color); // Верх
+                    context.fill(boxX, boxY + boxH - thickness, boxX + boxW, boxY + boxH, color); // Низ
+                    context.fill(boxX, boxY, boxX + thickness, boxY + boxH, color); // Лево
+                    context.fill(boxX + boxW - thickness, boxY, boxX + boxW, boxY + boxH, color); // Право
+
+                    // Полоска здоровья
+                    int hpWidth = 2; // Тоньше полоска
+                    int hpMargin = 2; // Ближе к рамке
+                    int hpX = boxX + boxW + hpMargin;
+                    
+                    float hpPercent = re.living.getHealth() / re.living.getMaxHealth();
+                    int activeHpHeight = (int) (boxH * hpPercent);
+                    
+                    int bgAlpha = (int)(170 * alphaFactor);
+                    int bgColor = (bgAlpha << 24) | 0x00000000;
+                    context.fill(hpX, boxY, hpX + hpWidth, boxY + boxH, bgColor); // Фон
+                    
+                    int hpAlpha = (int)(255 * alphaFactor);
+                    int baseColor = hpPercent > 0.5 ? 0x0000FF00 : (hpPercent > 0.2 ? 0x00FFFF00 : 0x00FF0000); // Яркие цвета
+                    int hpColor = (hpAlpha << 24) | baseColor;
+                    context.fill(hpX, boxY + boxH - activeHpHeight, hpX + hpWidth, boxY + boxH, hpColor);
+
+                    // Отрисовка масштабируемого имени
+                    if (showNames) {
+                        String name;
+                        if (re.entity instanceof net.minecraft.world.entity.player.Player playerEntity) {
+                            name = playerEntity.getScoreboardName().toUpperCase();
+                        } else {
+                            name = re.entity.getType().toShortString().toUpperCase();
+                        }
+                        
+                        // Скейл зависит от расстояния (в 2 раза меньше)
+                        float scale = 0.5f;
+                        if (re.distance < 10) {
+                            scale = 0.5f + (float) ((10 - re.distance) / 20.0f); // Максимум 1.0x в упор
+                        } else {
+                            scale = Math.max(0.2f, 5.0f / (float)re.distance); // Минимальный 0.2x вдалеке
+                        }
+
+                        try {
+                            context.pose().pushPose();
+                            context.pose().translate(boxX + boxW / 2.0f, boxY - (10 * scale), 0.0f);
+                            context.pose().scale(scale, scale, 1.0f);
+                            
+                            // Добавляем полупрозрачный темный фон под текст, чтобы он читался даже когда сливается
+                            int textWidth = client.font.width(name);
+                            int textBgAlpha = (int)(170 * alphaFactor);
+                            int textBgColor = (textBgAlpha << 24) | 0x00000000;
+                            context.fill(-textWidth / 2 - 2, -1, textWidth / 2 + 2, 8, textBgColor); // Фон под текстом
+                            
+                            int textAlpha = (int)(255 * alphaFactor);
+                            int textColor = (textAlpha << 24) | 0x00FFFFFF;
+                            context.drawCenteredString(client.font, name, 0, 0, textColor);
+                            context.pose().popPose();
+                        } catch (Throwable e) {
+                            int textAlpha = (int)(255 * alphaFactor);
+                            int textColor = (textAlpha << 24) | 0x00FFFFFF;
+                            context.drawCenteredString(client.font, name, boxX + boxW / 2, (int)(boxY - 10), textColor);
+                        }
+                }
+                }
+            }
+            } // close if (wallhackEnabled)
+            
+            int centerX = screenWidth / 2;
+            int centerY = screenHeight / 2;
+            
+            // Отрисовка линии к цели (Target Line)
+            if (aaEnabled && aaDrawTargetLine && currentTargetForLine != null) {
+                double lerpX = Mth.lerp(tick, currentTargetForLine.xOld, currentTargetForLine.getX());
+                double lerpY = Mth.lerp(tick, currentTargetForLine.yOld, currentTargetForLine.getY()) + currentTargetForLine.getBbHeight() / 2.0;
+                double lerpZ = Mth.lerp(tick, currentTargetForLine.zOld, currentTargetForLine.getZ());
+                
+                Vec3 P = new Vec3(lerpX, lerpY, lerpZ).subtract(camPos);
+                double zPrime = P.dot(F);
+                if (zPrime > 0.1) {
+                    double xPrime = P.dot(R);
+                    double yPrime = P.dot(U);
+                    double sX = centerX + (xPrime / zPrime) * (screenHeight / 2.0) / halfFovTan;
+                    double sY = centerY - (yPrime / zPrime) * (screenHeight / 2.0) / halfFovTan;
+                    
+                    int dx = (int) (sX - centerX);
+                    int dy = (int) (sY - centerY);
+                    int steps = Math.max(Math.abs(dx), Math.abs(dy));
+                    if (steps > 0) {
+                        for (int i = 0; i <= steps; i++) {
+                            int lx = centerX + (dx * i / steps);
+                            int ly = centerY + (dy * i / steps);
+                            context.fill(lx, ly, lx + 1, ly + 1, 0xAAFF0000); // Красная полупрозрачная линия
+                        }
+                    }
+                }
+            }
+
+            // Отрисовка круга FOV для Авто-Атаки
+            if (aaEnabled && aaDrawFov) {
+                float gameFov = client.options.fov().get().floatValue();
+                float pixelPerDegree = screenHeight / gameFov;
+                int radiusPixels = (int) (pixelPerDegree * (aaFov / 2.0f));
+                
+                // Рисуем красивую тонкую линию в 1 пиксель
+                for (double i = 0; i < 360; i += 0.2) {
+                    double rad = Math.toRadians(i);
+                    int px = centerX + (int)(Math.cos(rad) * radiusPixels);
+                    int py = centerY + (int)(Math.sin(rad) * radiusPixels);
+                    context.fill(px, py, px + 1, py + 1, 0x88FFFFFF); // Белая линия, немного прозрачная (88 альфа)
+                }
+            }
+        });
+    }
+
+    public static void unload() {
+        isEnabled = false;
+        wallhackEnabled = false;
+    }
+}
+package com.funmod;
+
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.network.chat.Component;
+import net.minecraft.client.gui.components.EditBox;
+import org.lwjgl.glfw.GLFW;
+import java.util.List;
+import java.util.ArrayList;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.core.registries.BuiltInRegistries;
+
+public class FunModScreen extends Screen {
+
+    private int activeTab = 0; // 0 = Функции, 1 = Интерфейс
+    private boolean showSettings = false;
+    private int activeSettings = 0; // 0 = WH, 1 = AutoAttack, 2 = Block ESP, 3 = AutoTotem, 4 = Freecam, 5 = AutoClicker
+    private int listeningForBind = -1;
+
+    private EditBox searchBox;
+    private List<String> allBlocks = new ArrayList<>();
+    private List<String> filteredBlocks = new ArrayList<>();
+    private int scrollOffset = 0;
+
+    private void sortFilteredBlocks() {
+        filteredBlocks.sort((b1, b2) -> {
+            boolean s1 = Main.espBlocks.contains(b1);
+            boolean s2 = Main.espBlocks.contains(b2);
+            if (s1 && !s2) return -1;
+            if (!s1 && s2) return 1;
+            return b1.compareTo(b2);
+        });
+    }
+
+    public FunModScreen() {
+        super(Component.literal("Verity Mod"));
+    }
+
+    @Override
+    protected void init() {
+        super.init();
+
+        int centerX = this.width / 2;
+        int centerY = this.height / 2;
+        int menuWidth = 360;
+        int menuHeight = 280;
+        int left = centerX - menuWidth / 2;
+        int top = centerY - menuHeight / 2;
+        int tabWidth = 100;
+
+        // Вкладки слева
+        this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+            activeTab = 0;
+            listeningForBind = -1;
+            this.rebuildWidgets();
+        }).bounds(left, top + 40, tabWidth, 24).build());
+
+        this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+            activeTab = 1;
+            showSettings = false;
+            listeningForBind = -1;
+            this.rebuildWidgets();
+        }).bounds(left, top + 68, tabWidth, 24).build());
+
+        int itemX = left + tabWidth + 20;
+        int itemW = 210;
+        int itemH = 38;
+        int startY = top + 15;
+        int ySpacing = 43;
+
+        if (activeTab == 0) {
+            // === ВКЛАДКА: ФУНКЦИИ ===
+
+            // 1. ВХ (Wallhack)
+            int whY = startY;
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                Main.wallhackEnabled = !Main.wallhackEnabled;
+            }).bounds(itemX, whY, itemW - 75, itemH).build());
+
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                listeningForBind = (listeningForBind == 0) ? -1 : 0;
+                this.rebuildWidgets();
+            }).bounds(itemX + itemW - 75, whY, 42, itemH).build());
+
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                showSettings = true;
+                activeSettings = 0;
+                this.rebuildWidgets();
+            }).bounds(itemX + itemW - 33, whY, 33, itemH).build());
+
+            // 2. Авто-Атака (KillAura)
+            int aaY = startY + ySpacing;
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                Main.aaEnabled = !Main.aaEnabled;
+            }).bounds(itemX, aaY, itemW - 75, itemH).build());
+
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                listeningForBind = (listeningForBind == 1) ? -1 : 1;
+                this.rebuildWidgets();
+            }).bounds(itemX + itemW - 75, aaY, 42, itemH).build());
+
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                showSettings = true;
+                activeSettings = 1;
+                this.rebuildWidgets();
+            }).bounds(itemX + itemW - 33, aaY, 33, itemH).build());
+
+            // 3. Block ESP
+            int espY = startY + ySpacing * 2;
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                Main.blockEspEnabled = !Main.blockEspEnabled;
+            }).bounds(itemX, espY, itemW - 75, itemH).build());
+
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                listeningForBind = (listeningForBind == 2) ? -1 : 2;
+                this.rebuildWidgets();
+            }).bounds(itemX + itemW - 75, espY, 42, itemH).build());
+
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                showSettings = true;
+                activeSettings = 2;
+                this.rebuildWidgets();
+            }).bounds(itemX + itemW - 33, espY, 33, itemH).build());
+
+            // 4. Авто-Тотем
+            int totemY = startY + ySpacing * 3;
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                Main.autoTotemEnabled = !Main.autoTotemEnabled;
+            }).bounds(itemX, totemY, itemW - 75, itemH).build());
+
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                listeningForBind = (listeningForBind == 3) ? -1 : 3;
+                this.rebuildWidgets();
+            }).bounds(itemX + itemW - 75, totemY, 42, itemH).build());
+
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                showSettings = true;
+                activeSettings = 3;
+                this.rebuildWidgets();
+            }).bounds(itemX + itemW - 33, totemY, 33, itemH).build());
+
+            // 5. Свободная камера (Freecam)
+            int fcY = startY + ySpacing * 4;
+            this.addWidget(net.minecraft.client.gui.components.Button.builder(Component.literal(""), button -> {
+                if (this.minecraft != null) {
+                    Main.toggleFreecam(this.minecraft);
+                }
+            }).bounds(itemX, fcY, itemW - 75, itemH).build());
+        }
+
+        if (allBlocks.isEmpty()) {
+            for (net.minecraft.resources.ResourceLocation loc : BuiltInRegistries.BLOCK.keySet()) {
+                allBlocks.add(loc.getPath());
+            }
+            filteredBlocks.addAll(allBlocks);
+            sortFilteredBlocks();
+        }
+
+        if (showSettings && activeSettings == 2) {
+            int setX = left + menuWidth + 10;
+            searchBox = new EditBox(this.font, setX + 10, top + 35, 140, 20, Component.literal("Поиск..."));
+            searchBox.setMaxLength(50);
+            searchBox.setResponder(text -> {
+                filteredBlocks.clear();
+                for (String b : allBlocks) {
+                    if (b.toLowerCase().contains(text.toLowerCase())) {
+                        filteredBlocks.add(b);
+                    }
+                }
+                sortFilteredBlocks();
+                scrollOffset = 0;
+            });
+            this.addWidget(searchBox);
+        }
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+        if (showSettings && activeSettings == 2) {
+            int setX = this.width / 2 - 180 + 360 + 10;
+            int setY = this.height / 2 - 140;
+            int setW = 160;
+            int setH = 245;
+            if (mouseX >= setX && mouseX <= setX + setW && mouseY >= setY && mouseY <= setY + setH) {
+                if (scrollY > 0) {
+                    scrollOffset = Math.max(0, scrollOffset - 1);
+                } else if (scrollY < 0) {
+                    scrollOffset = Math.min(Math.max(0, filteredBlocks.size() - 8), scrollOffset + 1);
+                }
+                return true;
+            }
+        }
+        return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+    }
+
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (showSettings && activeSettings == 2 && button == 0) {
+            int setX = this.width / 2 - 180 + 360 + 10; 
+            int setY = this.height / 2 - 140;
+            
+            int yPos = setY + 65;
+            for (int i = scrollOffset; i < Math.min(filteredBlocks.size(), scrollOffset + 8); i++) {
+                if (mouseX >= setX + 10 && mouseX <= setX + 150 && mouseY >= yPos && mouseY < yPos + 18) {
+                    String blockName = filteredBlocks.get(i);
+                    if (Main.espBlocks.contains(blockName)) {
+                        Main.espBlocks.remove(blockName);
+                    } else {
+                        Main.espBlocks.add(blockName);
+                    }
+                    sortFilteredBlocks();
+                    return true;
+                }
+                yPos += 20;
+            }
+        }
+        return super.mouseClicked(mouseX, mouseY, button);
+    }
+
+    @Override
+    public void render(GuiGraphics context, int mouseX, int mouseY, float delta) {
+        super.render(context, mouseX, mouseY, delta);
+
+        int centerX = this.width / 2;
+        int centerY = this.height / 2;
+        int menuWidth = 360;
+        int menuHeight = 280;
+        int left = centerX - menuWidth / 2;
+        int top = centerY - menuHeight / 2;
+        int tabWidth = 100;
+        int borderColor = 0xFF553399;
+
+        Main.drawStringSafely(context, this.font, Component.literal("§lFUN MOD"), left + 15, top + 15, 0xFFBB66FF);
+        
+        boolean hoverTab = mouseX >= left && mouseX <= left + tabWidth && mouseY >= top + 40 && mouseY <= top + 60;
+        context.fill(left, top + 40, left + tabWidth, top + 60, activeTab == 0 ? 0x888822FF : (hoverTab ? 0x448822FF : 0x00000000));
+        Main.drawStringSafely(context, this.font, Component.literal("Функции"), left + 20, top + 46, 0xFFFFFFFF);
+
+        if (activeTab == 0) {
+            int itemW = 200;
+            int itemH = 40;
+            int itemX = left + tabWidth + 20;
+
+            // Отрисовка ВХ
+            int whY = top + 20;
+            boolean hWh = mouseX >= itemX && mouseX <= itemX + itemW - 40 && mouseY >= whY && mouseY <= whY + itemH;
+            boolean hWhSet = mouseX >= itemX + itemW - 40 && mouseX <= itemX + itemW && mouseY >= whY && mouseY <= whY + itemH;
+            
+            context.fill(itemX, whY, itemX + itemW - 40, whY + itemH, hWh ? 0x88441188 : 0x44220044);
+            context.fill(itemX + itemW - 40, whY, itemX + itemW, whY + itemH, hWhSet || (showSettings && activeSettings == 0) ? 0xAA6622AA : 0x66441188);
+            context.fill(itemX, whY, itemX + 4, whY + itemH, Main.wallhackEnabled ? 0xFF00FF00 : 0xFFFF0000);
+            
+            Main.drawStringSafely(context, this.font, Component.literal("ВХ (Wallhack)"), itemX + 15, whY + 10, 0xFFFFFFFF);
+            Main.drawStringSafely(context, this.font, Component.literal("§8Нажми для Вкл/Выкл"), itemX + 15, whY + 24, 0xFFFFFFFF);
+            context.drawCenteredString(this.font, Component.literal("⚙"), itemX + itemW - 20, whY + 16, 0xFFFFFFFF);
+
+            // Отрисовка Авто-Атаки
+            int aaY = whY + 50;
+            boolean hAa = mouseX >= itemX && mouseX <= itemX + itemW - 40 && mouseY >= aaY && mouseY <= aaY + itemH;
+            boolean hAaSet = mouseX >= itemX + itemW - 40 && mouseX <= itemX + itemW && mouseY >= aaY && mouseY <= aaY + itemH;
+            
+            context.fill(itemX, aaY, itemX + itemW - 40, aaY + itemH, hAa ? 0x88441188 : 0x44220044);
+            context.fill(itemX + itemW - 40, aaY, itemX + itemW, aaY + itemH, hAaSet || (showSettings && activeSettings == 1) ? 0xAA6622AA : 0x66441188);
+            context.fill(itemX, aaY, itemX + 4, aaY + itemH, Main.aaEnabled ? 0xFF00FF00 : 0xFFFF0000);
+            
+            Main.drawStringSafely(context, this.font, Component.literal("Авто-Атака (KillAura)"), itemX + 15, aaY + 10, 0xFFFFFFFF);
+            Main.drawStringSafely(context, this.font, Component.literal("§8Нажми для Вкл/Выкл"), itemX + 15, aaY + 24, 0xFFFFFFFF);
+            context.drawCenteredString(this.font, Component.literal("⚙"), itemX + itemW - 20, aaY + 16, 0xFFFFFFFF);
+
+            // Отрисовка Block ESP
+            int espY = whY + 100;
+            boolean hEsp = mouseX >= itemX && mouseX <= itemX + itemW - 40 && mouseY >= espY && mouseY <= espY + itemH;
+            boolean hEspSet = mouseX >= itemX + itemW - 40 && mouseX <= itemX + itemW && mouseY >= espY && mouseY <= espY + itemH;
+            
+            context.fill(itemX, espY, itemX + itemW - 40, espY + itemH, hEsp ? 0x88441188 : 0x44220044);
+            context.fill(itemX + itemW - 40, espY, itemX + itemW, espY + itemH, hEspSet || (showSettings && activeSettings == 2) ? 0xAA6622AA : 0x66441188);
+            context.fill(itemX, espY, itemX + 4, espY + itemH, Main.blockEspEnabled ? 0xFF00FF00 : 0xFFFF0000);
+            
+            Main.drawStringSafely(context, this.font, Component.literal("Block ESP"), itemX + 15, espY + 10, 0xFFFFFFFF);
+            Main.drawStringSafely(context, this.font, Component.literal("§8Нажми для Вкл/Выкл"), itemX + 15, espY + 24, 0xFFFFFFFF);
+            context.drawCenteredString(this.font, Component.literal("⚙"), itemX + itemW - 20, espY + 16, 0xFFFFFFFF);
+
+            // Отрисовка AutoTotem
+            int totemY = whY + 150;
+            boolean hTotem = mouseX >= itemX && mouseX <= itemX + itemW - 40 && mouseY >= totemY && mouseY <= totemY + itemH;
+            boolean hTotemSet = mouseX >= itemX + itemW - 40 && mouseX <= itemX + itemW && mouseY >= totemY && mouseY <= totemY + itemH;
+
+            context.fill(itemX, totemY, itemX + itemW - 40, totemY + itemH, hTotem ? 0x88441188 : 0x44220044);
+            context.fill(itemX + itemW - 40, totemY, itemX + itemW, totemY + itemH, hTotemSet || (showSettings && activeSettings == 3) ? 0xAA6622AA : 0x66441188);
+            context.fill(itemX, totemY, itemX + 4, totemY + itemH, Main.autoTotemEnabled ? 0xFF00FF00 : 0xFFFF0000);
+
+            Main.drawStringSafely(context, this.font, Component.literal("Авто-Тотем"), itemX + 15, totemY + 10, 0xFFFFFFFF);
+            Main.drawStringSafely(context, this.font, Component.literal("§8Нажми для Вкл/Выкл"), itemX + 15, totemY + 24, 0xFFFFFFFF);
+            context.drawCenteredString(this.font, Component.literal("⚙"), itemX + itemW - 20, totemY + 16, 0xFFFFFFFF);
+            
+            // Отрисовка Freecam
+            int fcY = whY + 200;
+            boolean hFc = mouseX >= itemX && mouseX <= itemX + itemW && mouseY >= fcY && mouseY <= fcY + itemH;
+            
+            context.fill(itemX, fcY, itemX + itemW, fcY + itemH, hFc ? 0x88441188 : 0x44220044);
+            context.fill(itemX, fcY, itemX + 4, fcY + itemH, Main.freecamEnabled ? 0xFF00FF00 : 0xFFFF0000);
+            
+            Main.drawStringSafely(context, this.font, Component.literal("Freecam"), itemX + 15, fcY + 10, 0xFFFFFFFF);
+            Main.drawStringSafely(context, this.font, Component.literal("§8Свободная камера"), itemX + 15, fcY + 24, 0xFFFFFFFF);
+        }
+
+        // Мини-меню
+        if (showSettings) {
+            int setX = left + menuWidth + 10;
+            int setY = top;
+            int setW = 160;
+            int setH = activeSettings == 0 ? 100 : (activeSettings == 1 ? 245 : (activeSettings == 2 ? 245 : 100));
+            
+            context.fill(setX, setY, setX + setW, setY + setH, 0xEE110816);
+            context.fill(setX - 1, setY - 1, setX + setW + 1, setY, borderColor);
+            context.fill(setX - 1, setY + setH, setX + setW + 1, setY + setH + 1, borderColor);
+            context.fill(setX - 1, setY, setX, setY + setH, borderColor);
+            context.fill(setX + setW, setY, setX + setW + 1, setY + setH, borderColor);
+            
+            if (activeSettings == 0) {
+                Main.drawStringSafely(context, this.font, Component.literal("§lНастройки ВХ"), setX + 10, setY + 10, 0xFFBB66FF);
+                
+                int targetY = setY + 35;
+                boolean hTarg = mouseX >= setX && mouseX <= setX + setW && mouseY >= targetY && mouseY <= targetY + 20;
+                context.fill(setX, targetY, setX + setW, targetY + 20, hTarg ? 0x66441188 : 0x00000000);
+                String tTxt = Main.targetMode == 0 ? "Игроки" : (Main.targetMode == 1 ? "Мобы" : "Игроки+Мобы");
+                Main.drawStringSafely(context, this.font, Component.literal("Цель: §f" + tTxt), setX + 10, targetY + 6, 0xFFAAAAAA);
+                
+                int nameY = setY + 60;
+                boolean hName = mouseX >= setX && mouseX <= setX + setW && mouseY >= nameY && mouseY <= nameY + 20;
+                context.fill(setX, nameY, setX + setW, nameY + 20, hName ? 0x66441188 : 0x00000000);
+                Main.drawStringSafely(context, this.font, Component.literal("Ники: " + (Main.showNames ? "§aВКЛ" : "§cВЫКЛ")), setX + 10, nameY + 6, 0xFFAAAAAA);
+            } else if (activeSettings == 1) {
+                Main.drawStringSafely(context, this.font, Component.literal("§lНастройки Авто-Атаки"), setX + 10, setY + 10, 0xFFBB66FF);
+                
+                // 1. Цель
+                int y = setY + 35;
+                boolean h1 = mouseX >= setX && mouseX <= setX + setW && mouseY >= y && mouseY <= y + 20;
+                context.fill(setX, y, setX + setW, y + 20, h1 ? 0x66441188 : 0x00000000);
+                String tTxt = Main.aaTargetMode == 0 ? "Игроки" : "Игроки+Мобы";
+                Main.drawStringSafely(context, this.font, Component.literal("Цель: §f" + tTxt), setX + 10, y + 6, 0xFFAAAAAA);
+                
+                // 2. FOV
+                y += 25;
+                boolean h2 = mouseX >= setX && mouseX <= setX + setW && mouseY >= y && mouseY <= y + 20;
+                context.fill(setX, y, setX + setW, y + 20, h2 ? 0x66441188 : 0x00000000);
+                Main.drawStringSafely(context, this.font, Component.literal("Радиус обзора: §e" + Main.aaFov + "°"), setX + 10, y + 6, 0xFFAAAAAA);
+                
+                // 3. Скорость наводки
+                y += 25;
+                boolean hS = mouseX >= setX && mouseX <= setX + setW && mouseY >= y && mouseY <= y + 20;
+                context.fill(setX, y, setX + setW, y + 20, hS ? 0x66441188 : 0x00000000);
+                Main.drawStringSafely(context, this.font, Component.literal("Скорость: §e" + Main.aaSpeed), setX + 10, y + 6, 0xFFAAAAAA);
+
+                // 4. Дистанция
+                y += 25;
+                boolean h3 = mouseX >= setX && mouseX <= setX + setW && mouseY >= y && mouseY <= y + 20;
+                context.fill(setX, y, setX + setW, y + 20, h3 ? 0x66441188 : 0x00000000);
+                Main.drawStringSafely(context, this.font, Component.literal("Дальность: §e" + Main.aaRadius + " бл."), setX + 10, y + 6, 0xFFAAAAAA);
+
+                // 5. Только Крит
+                y += 25;
+                boolean h4 = mouseX >= setX && mouseX <= setX + setW && mouseY >= y && mouseY <= y + 20;
+                context.fill(setX, y, setX + setW, y + 20, h4 ? 0x66441188 : 0x00000000);
+                Main.drawStringSafely(context, this.font, Component.literal("Только Крит: " + (Main.aaCritOnly ? "§aВКЛ" : "§cВЫКЛ")), setX + 10, y + 6, 0xFFAAAAAA);
+                
+                // 6. Только Оружие
+                y += 25;
+                boolean h5 = mouseX >= setX && mouseX <= setX + setW && mouseY >= y && mouseY <= y + 20;
+                context.fill(setX, y, setX + setW, y + 20, h5 ? 0x66441188 : 0x00000000);
+                Main.drawStringSafely(context, this.font, Component.literal("Оружие в руках: " + (Main.aaWeaponOnly ? "§aВКЛ" : "§cВЫКЛ")), setX + 10, y + 6, 0xFFAAAAAA);
+
+                // 7. Визуализация FOV
+                y += 25;
+                boolean h6 = mouseX >= setX && mouseX <= setX + setW && mouseY >= y && mouseY <= y + 20;
+                context.fill(setX, y, setX + setW, y + 20, h6 ? 0x66441188 : 0x00000000);
+                Main.drawStringSafely(context, this.font, Component.literal("Круг FOV: " + (Main.aaDrawFov ? "§aВКЛ" : "§cВЫКЛ")), setX + 10, y + 6, 0xFFAAAAAA);
+                
+                // 8. Линия наведения
+                y += 25;
+                boolean h7 = mouseX >= setX && mouseX <= setX + setW && mouseY >= y && mouseY <= y + 20;
+                context.fill(setX, y, setX + setW, y + 20, h7 ? 0x66441188 : 0x00000000);
+                Main.drawStringSafely(context, this.font, Component.literal("Линия к цели: " + (Main.aaDrawTargetLine ? "§aВКЛ" : "§cВЫКЛ")), setX + 10, y + 6, 0xFFAAAAAA);
+            } else if (activeSettings == 2) {
+                Main.drawStringSafely(context, this.font, Component.literal("§lБлоки ESP"), setX + 10, setY + 10, 0xFFBB66FF);
+                searchBox.render(context, mouseX, mouseY, delta);
+                
+                int yPos = setY + 65;
+                for (int i = scrollOffset; i < Math.min(filteredBlocks.size(), scrollOffset + 8); i++) {
+                    String blockName = filteredBlocks.get(i);
+                    boolean isSelected = Main.espBlocks.contains(blockName);
+                    boolean hovered = mouseX >= setX + 10 && mouseX <= setX + 150 && mouseY >= yPos && mouseY < yPos + 18;
+                    
+                    context.fill(setX + 10, yPos, setX + 150, yPos + 18, hovered ? 0x44FFFFFF : 0x22FFFFFF);
+                    Main.drawStringSafely(context, this.font, Component.literal(blockName), setX + 14, yPos + 5, isSelected ? 0xFF00FF00 : 0xFFFFFFFF);
+                    yPos += 20;
+                }
+            } else if (activeSettings == 3) {
+                Main.drawStringSafely(context, this.font, Component.literal("§lАвто-Тотем"), setX + 10, setY + 10, 0xFFBB66FF);
+            }
+        }
+    }
+    
+    @Override
+    public boolean isPauseScreen() {
+        return false;
+    }
+}
+package com.funmod;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.network.chat.Component;
+import com.mojang.blaze3d.platform.InputConstants;
+import java.util.ArrayList;
+import java.util.List;
+
+public class HudRenderer {
+
+    public static String getKeyName(int keyCode) {
+        if (keyCode <= 0) return "NONE";
+        try {
+            return InputConstants.Type.KEYSYM.getOrCreate(keyCode).getDisplayName().getString().toUpperCase();
+        } catch (Throwable t) {
+            return "KEY " + keyCode;
+        }
+    }
+
+    // Размеры FPS
+    public static int[] getFpsDimensions(Minecraft client, float scale) {
+        int fps = client.getFps();
+        int ping = 0;
+        try {
+            if (client.getConnection() != null && client.player != null) {
+                var entry = client.getConnection().getPlayerInfo(client.player.getUUID());
+                if (entry != null) ping = entry.getLatency();
+            }
+        } catch (Throwable ignored) {}
+
+        String text = "§lVERITY §7| §fFPS: §a" + fps + " §7| §fPING: §b" + ping + "ms";
+        int textW = client.font.width(Component.literal(text));
+        int boxW = textW + 16;
+        int boxH = 18;
+        return new int[]{(int)(boxW * scale), (int)(boxH * scale)};
+    }
+
+    // 1. Отрисовка FPS / Watermark
+    public static int[] renderFps(GuiGraphics context, Minecraft client, int x, int y, float scale, boolean isEditor) {
+        int fps = client.getFps();
+        int ping = 0;
+        try {
+            if (client.getConnection() != null && client.player != null) {
+                var entry = client.getConnection().getPlayerInfo(client.player.getUUID());
+                if (entry != null) ping = entry.getLatency();
+            }
+        } catch (Throwable ignored) {}
+
+        String text = "§lVERITY §7| §fFPS: §a" + fps + " §7| §fPING: §b" + ping + "ms";
+        int textW = client.font.width(Component.literal(text));
+        int boxW = textW + 16;
+        int boxH = 18;
+
+        context.pose().pushPose();
+        context.pose().translate(x, y, 0);
+        context.pose().scale(scale, scale, 1.0f);
+
+        // Фон
+        context.fill(0, 0, boxW, boxH, 0xEE110816);
+        // Обводка
+        context.fill(-1, -1, boxW + 1, 0, 0xFF8822FF);
+        context.fill(-1, boxH, boxW + 1, boxH + 1, 0xFF8822FF);
+        context.fill(-1, 0, 0, boxH, 0xFF8822FF);
+        context.fill(boxW, 0, boxW + 1, boxH, 0xFF8822FF);
+        // Фиолетовый акцент слева
+        context.fill(0, 0, 3, boxH, 0xFFBB66FF);
+
+        Main.drawStringSafely(context, client.font, Component.literal(text), 8, 5, 0xFFFFFFFF);
+
+        context.pose().popPose();
+
+        return new int[]{(int)(boxW * scale), (int)(boxH * scale)};
+    }
+
+    // Размеры Биндов
+    public static int[] getKeybindsDimensions(Minecraft client, float scale, boolean isEditor) {
+        int count = 0;
+        if (Main.bindWH > 0 || isEditor) count++;
+        if (Main.bindAA > 0 || isEditor) count++;
+        if (Main.bindESP > 0 || isEditor) count++;
+        if (Main.bindTotem > 0 || isEditor) count++;
+        if (Main.bindFreecam > 0 || isEditor) count++;
+        if (Main.bindAutoClicker > 0 || isEditor) count++;
+
+        if (count == 0 && !isEditor) return new int[]{0, 0};
+
+        int headerH = 16;
+        int rowH = 14;
+        int boxW = 140;
+        int boxH = headerH + Math.max(1, count) * rowH + 4;
+        return new int[]{(int)(boxW * scale), (int)(boxH * scale)};
+    }
+
+    // 2. Отрисовка Биндов (Keybinds List)
+    public static int[] renderKeybinds(GuiGraphics context, Minecraft client, int x, int y, float scale, boolean isEditor) {
+        List<String[]> binds = new ArrayList<>();
+        if (Main.bindWH > 0 || isEditor) {
+            binds.add(new String[]{"ВХ", getKeyName(Main.bindWH), Main.wallhackEnabled ? "§aВКЛ" : "§cВЫКЛ"});
+        }
+        if (Main.bindAA > 0 || isEditor) {
+            binds.add(new String[]{"Авто-Атака", getKeyName(Main.bindAA), Main.aaEnabled ? "§aВКЛ" : "§cВЫКЛ"});
+        }
+        if (Main.bindESP > 0 || isEditor) {
+            binds.add(new String[]{"Block ESP", getKeyName(Main.bindESP), Main.blockEspEnabled ? "§aВКЛ" : "§cВЫКЛ"});
+        }
+        if (Main.bindTotem > 0 || isEditor) {
+            binds.add(new String[]{"Авто-Тотем", getKeyName(Main.bindTotem), Main.autoTotemEnabled ? "§aВКЛ" : "§cВЫКЛ"});
+        }
+        if (Main.bindFreecam > 0 || isEditor) {
+            binds.add(new String[]{"Свободная камера", getKeyName(Main.bindFreecam), Main.freecamEnabled ? "§aВКЛ" : "§cВЫКЛ"});
+        }
+        if (Main.bindAutoClicker > 0 || isEditor) {
+            binds.add(new String[]{"Авто-Кликер", getKeyName(Main.bindAutoClicker), Main.autoClickerEnabled ? "§aВКЛ" : "§cВЫКЛ"});
+        }
+
+        if (binds.isEmpty() && !isEditor) {
+            return new int[]{0, 0};
+        }
+
+        List<String> activeModules = new ArrayList<>();
+        if (Main.wallhackEnabled || isEditor) activeModules.add("ВХ (Wallhack)");
+        if (Main.aaEnabled || isEditor) activeModules.add("Авто-Атака (KillAura)");
+        if (Main.blockEspEnabled || isEditor) activeModules.add("Block ESP");
+        if (Main.autoTotemEnabled || isEditor) activeModules.add("Авто-Тотем");
+
+        if (activeModules.isEmpty() && !isEditor) {
+            return new int[]{0, 0};
+        }
+
+        int rowH = 14;
+        int maxW = 80;
+        for (String mod : activeModules) {
+            int w = client.font.width(Component.literal(mod)) + 14;
+            if (w > maxW) maxW = w;
+        }
+
+        int boxW = maxW;
+        int boxH = activeModules.size() * rowH;
+
+        return new int[]{boxW, boxH};
+    }
+    }
